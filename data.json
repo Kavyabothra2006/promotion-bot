@@ -1,5 +1,6 @@
 {
   "users": {},
   "videos": [],
-  "welcome_image_file_id": null
+  "welcome_image_file_id": null,
+  "forced_channels": []
 }
