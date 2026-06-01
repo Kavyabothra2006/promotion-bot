@@ -42,8 +42,13 @@ REFERRER_BONUS = 2
 VIDEO_COST = 1
 DELETE_AFTER_SECONDS = 300
 
-DATA_FILE = Path("data.json")
+DATA_FILE = Path("/data/data.json")
 
+if not DATA_FILE.exists():
+    DATA_FILE.write_text(
+        '{"users":{},"videos":[],"welcome_image_file_id":null,"forced_channels":[]}',
+        encoding="utf-8"
+    )
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
