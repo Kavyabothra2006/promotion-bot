@@ -104,27 +104,31 @@ def timestamp() -> str:
 
 def load_data() -> Dict[str, Any]:
     if not DATA_FILE.exists():
-        return {"users": {}, "videos": [], "welcome_image_file_id": None}
+        return {"users": {}, "videos": [], "welcome_image_file_id": None, "forced_channels": []}
     try:
         with DATA_FILE.open("r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
-            return {"users": {}, "videos": [], "welcome_image_file_id": None}
+            return {"users": {}, "videos": [], "welcome_image_file_id": None, "forced_channels": []}
         if "users" not in data or not isinstance(data["users"], dict):
             data["users"] = {}
         if "videos" not in data or not isinstance(data["videos"], list):
             data["videos"] = []
         if "welcome_image_file_id" not in data:
             data["welcome_image_file_id"] = None
+        if "forced_channels" not in data or not isinstance(data["forced_channels"], list):
+            data["forced_channels"] = []
         return data
     except Exception as exc:
         logger.warning("Failed to read data.json: %s", exc)
-        return {"users": {}, "videos": [], "welcome_image_file_id": None}
+        return {"users": {}, "videos": [], "welcome_image_file_id": None, "forced_channels": []}
 
 
 def save_data(data: Dict[str, Any]) -> None:
     if "welcome_image_file_id" not in data:
         data["welcome_image_file_id"] = None
+    if "forced_channels" not in data or not isinstance(data["forced_channels"], list):
+        data["forced_channels"] = []
     tmp = DATA_FILE.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -143,6 +147,182 @@ def get_videos(data: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def get_welcome_image_file_id(data: Dict[str, Any]) -> str | None:
     return data.get("welcome_image_file_id")
+
+
+def get_forced_channels(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    channels = data.setdefault("forced_channels", [])
+    if not isinstance(channels, list):
+        channels = []
+        data["forced_channels"] = channels
+
+    normalized: List[Dict[str, Any]] = []
+    for item in channels:
+        if isinstance(item, dict):
+            chat_id = item.get("chat_id")
+            if chat_id is None:
+                continue
+            normalized.append(
+                {
+                    "chat_id": chat_id,
+                    "title": str(item.get("title") or str(chat_id)).strip(),
+                    "link": str(item.get("link") or "").strip() or None,
+                }
+            )
+
+    data["forced_channels"] = normalized
+    return normalized
+
+
+def legacy_required_channel_entry() -> Dict[str, Any] | None:
+    if not REQUIRED_CHAT_ID:
+        return None
+
+    link = REQUIRED_CHAT_LINK.strip() if REQUIRED_CHAT_LINK else ""
+    if not link and isinstance(REQUIRED_CHAT_ID, str) and REQUIRED_CHAT_ID.startswith("@"):
+        link = f"https://t.me/{REQUIRED_CHAT_ID.lstrip('@')}"
+    return {
+        "chat_id": REQUIRED_CHAT_ID,
+        "title": "Main Forced Channel",
+        "link": link or None,
+    }
+
+
+def normalize_channel_chat_id(value: str) -> int | str:
+    value = value.strip()
+    if value.startswith("-") and value[1:].isdigit():
+        return int(value)
+    if value.startswith("@"):
+        return value
+    if value.isdigit():
+        return int(value)
+    return value
+
+
+def normalize_channel_link(value: str) -> str | None:
+    value = value.strip()
+    if not value:
+        return None
+    if value.startswith("http://") or value.startswith("https://"):
+        return value
+    if value.startswith("@"):
+        return f"https://t.me/{value.lstrip('@')}"
+    return None
+
+
+def channel_join_link(channel: Dict[str, Any]) -> str | None:
+    link = channel.get("link")
+    if link:
+        return str(link).strip() or None
+
+    chat_id = channel.get("chat_id")
+    if isinstance(chat_id, str) and chat_id.startswith("@"):
+        return f"https://t.me/{chat_id.lstrip('@')}"
+    return None
+
+
+def channel_label(channel: Dict[str, Any], index: int) -> str:
+    title = str(channel.get("title") or "").strip()
+    if title:
+        return title
+    chat_id = channel.get("chat_id")
+    if isinstance(chat_id, str) and chat_id.startswith("@"):
+        return chat_id.lstrip("@")
+    return f"Channel {index}"
+
+
+def get_all_required_channels(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    channels: List[Dict[str, Any]] = []
+    legacy = legacy_required_channel_entry()
+    if legacy:
+        channels.append(legacy)
+    channels.extend(get_forced_channels(data))
+
+    unique: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for channel in channels:
+        chat_id = channel.get("chat_id")
+        if chat_id is None:
+            continue
+        key = str(chat_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(channel)
+    return unique[:5]
+
+
+def parse_forced_channel_input(raw: str) -> tuple[Dict[str, Any] | None, str | None]:
+    raw = raw.strip()
+    if not raw:
+        return None, "Send a channel username like @channelname, or use -1001234567890|https://t.me/+invite for private channels."
+
+    chat_part = raw
+    link_part = ""
+    if "|" in raw:
+        chat_part, link_part = [part.strip() for part in raw.split("|", 1)]
+
+    chat_id = normalize_channel_chat_id(chat_part)
+    link = normalize_channel_link(link_part) if link_part else None
+
+    if isinstance(chat_id, str) and chat_id.startswith("@"):
+        title = chat_id.lstrip("@")
+        if not link:
+            link = f"https://t.me/{title}"
+        return {"chat_id": chat_id, "title": title, "link": link}, None
+
+    if isinstance(chat_id, int):
+        if not link:
+            return None, (
+                "For private channels, send the channel id and invite link like:\n"
+                "-1001234567890|https://t.me/+invite-link"
+            )
+        return {"chat_id": chat_id, "title": f"Channel {chat_id}", "link": link}, None
+
+    if isinstance(chat_id, str) and chat_id.startswith("https://t.me/"):
+        username = chat_id.rstrip("/").split("/")[-1]
+        if username.startswith("+"):
+            return None, (
+                "Invite links alone cannot be used for membership checks. Send a public channel username or a chat id with invite link."
+            )
+        chat_id = f"@{username.lstrip('@')}"
+        title = username.lstrip("@")
+        if not link:
+            link = f"https://t.me/{title}"
+        return {"chat_id": chat_id, "title": title, "link": link}, None
+
+    return None, (
+        "Invalid channel format. Use @channelname for public channels or -1001234567890|https://t.me/+invite for private channels."
+    )
+
+
+def build_forced_channels_keyboard(data: Dict[str, Any]) -> InlineKeyboardMarkup:
+    channels = get_all_required_channels(data)
+    buttons: List[List[InlineKeyboardButton]] = []
+
+    for idx, channel in enumerate(channels, start=1):
+        link = channel_join_link(channel)
+        label = f"{idx}. {channel_label(channel, idx)}"
+        if link:
+            buttons.append([InlineKeyboardButton(label, url=link)])
+        else:
+            buttons.append([InlineKeyboardButton(label, callback_data="no_join_link")])
+
+    buttons.append([InlineKeyboardButton("Add Channel", callback_data="forced_channels_add")])
+    buttons.append([InlineKeyboardButton("Back", callback_data="forced_channels_back")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_forced_channels_text(data: Dict[str, Any]) -> str:
+    channels = get_all_required_channels(data)
+    if not channels:
+        return "Forced Channels\n\nNo forced channels are configured yet.\nUse Add Channel to add up to 5 channels."
+
+    lines = ["Forced Channels", "", f"Total required channels: {len(channels)}/5", ""]
+    for idx, channel in enumerate(channels, start=1):
+        lines.append(f"{idx}. {channel_label(channel, idx)}")
+    lines.append("")
+    lines.append("Users must join all of them before using the bot.")
+    return "\n".join(lines)
 
 
 def get_user(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
@@ -204,15 +384,24 @@ def menu_for_user(user_id: int):
     return admin_menu() if is_admin(user_id) else user_menu()
 
 
-async def is_member(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
-    if not REQUIRED_CHAT_ID:
-        return False
-    try:
-        member = await context.bot.get_chat_member(REQUIRED_CHAT_ID, user_id)
-        return member.status in ("member", "administrator", "creator")
-    except Exception as exc:
-        logger.warning("Join check failed: %s", exc)
-        return False
+async def is_member(context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: int | str | None = None) -> bool:
+    if chat_id is not None:
+        try:
+            member = await context.bot.get_chat_member(chat_id, user_id)
+            return member.status in ("member", "administrator", "creator")
+        except Exception as exc:
+            logger.warning("Join check failed for %s: %s", chat_id, exc)
+            return False
+
+    data = load_data()
+    channels = get_all_required_channels(data)
+    if not channels:
+        return True
+
+    for channel in channels:
+        if not await is_member(context, user_id, channel.get("chat_id")):
+            return False
+    return True
 
 
 def user_menu() -> ReplyKeyboardMarkup:
@@ -231,29 +420,37 @@ def admin_menu() -> ReplyKeyboardMarkup:
         [
             [KeyboardButton("Admin Dashboard"), KeyboardButton("Set Welcome Image")],
             [KeyboardButton("Add Video"), KeyboardButton("List Videos")],
-            [KeyboardButton("Broadcast")],
+            [KeyboardButton("Broadcast"), KeyboardButton("Forced Channels")],
         ],
         resize_keyboard=True,
     )
 
 
 def join_keyboard() -> InlineKeyboardMarkup:
-    if REQUIRED_CHAT_LINK:
-        join_button = InlineKeyboardButton("Join Channel / Group", url=REQUIRED_CHAT_LINK)
-    elif isinstance(REQUIRED_CHAT_ID, str) and REQUIRED_CHAT_ID.startswith("@"):
-        join_button = InlineKeyboardButton(
-            "Join Channel / Group",
-            url=f"https://t.me/{REQUIRED_CHAT_ID.lstrip('@')}",
-        )
-    else:
-        join_button = InlineKeyboardButton("Join Channel / Group", callback_data="no_join_link")
+    data = load_data()
+    channels = get_all_required_channels(data)
+    buttons: List[List[InlineKeyboardButton]] = []
 
-    return InlineKeyboardMarkup(
-        [
-            [join_button],
-            [InlineKeyboardButton("I Joined", callback_data="check_join")],
-        ]
-    )
+    if channels:
+        for idx, channel in enumerate(channels, start=1):
+            link = channel_join_link(channel)
+            label = f"Join {channel_label(channel, idx)}"
+            if link:
+                buttons.append([InlineKeyboardButton(label, url=link)])
+            else:
+                buttons.append([InlineKeyboardButton(label, callback_data="no_join_link")])
+    else:
+        if REQUIRED_CHAT_LINK:
+            buttons.append([InlineKeyboardButton("Join Channel / Group", url=REQUIRED_CHAT_LINK)])
+        elif isinstance(REQUIRED_CHAT_ID, str) and REQUIRED_CHAT_ID.startswith("@"):
+            buttons.append(
+                [InlineKeyboardButton("Join Channel / Group", url=f"https://t.me/{REQUIRED_CHAT_ID.lstrip('@')}")]
+            )
+        else:
+            buttons.append([InlineKeyboardButton("Join Channel / Group", callback_data="no_join_link")])
+
+    buttons.append([InlineKeyboardButton("I Joined", callback_data="check_join")])
+    return InlineKeyboardMarkup(buttons)
 
 
 def referral_share_markup(referral_link: str) -> InlineKeyboardMarkup:
@@ -272,10 +469,19 @@ def get_refer_button_markup() -> InlineKeyboardMarkup:
 
 
 async def send_join_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "You must join our channel/group first to use this bot.\n\n"
-        "After joining, press I Joined."
-    )
+    data = load_data()
+    channels = get_all_required_channels(data)
+    if channels:
+        lines = ["You must join all required channels/groups first to use this bot.", "", "Join all of these, then press I Joined:", ""]
+        for idx, channel in enumerate(channels, start=1):
+            lines.append(f"{idx}. {channel_label(channel, idx)}")
+        text = "\n".join(lines)
+    else:
+        text = (
+            "You must join our channel/group first to use this bot.\n\n"
+            "After joining, press I Joined."
+        )
+
     if update.message:
         await update.message.reply_text(text, reply_markup=join_keyboard())
     elif update.callback_query and update.callback_query.message:
@@ -619,6 +825,19 @@ async def do_get_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await send_next_video(update.message, context, update.effective_user.id)
 
 
+async def show_forced_channels_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        return
+
+    data = load_data()
+    await update.message.reply_text(
+        build_forced_channels_text(data),
+        reply_markup=build_forced_channels_keyboard(data),
+    )
+
+
 # =====================
 # COMMAND HANDLERS
 # =====================
@@ -818,6 +1037,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
+    if query.data == "forced_channels_back" and is_admin(user_id):
+        context.user_data["forced_channels_add_mode"] = False
+        await query.message.reply_text("Back to admin menu.", reply_markup=admin_menu())
+        return
+
+    if query.data == "forced_channels_add" and is_admin(user_id):
+        context.user_data["forced_channels_add_mode"] = True
+        await query.message.reply_text(
+            "Send the channel in one of these formats:\n"
+            "@publicchannel\n"
+            "-1001234567890|https://t.me/+invite-link",
+            reply_markup=admin_menu(),
+        )
+        return
+
     if query.data == "refer":
         if not await ensure_joined_or_gate(update, context):
             return
@@ -911,6 +1145,59 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
+    # Forced channels add mode
+    if is_admin(user_id) and context.user_data.get("forced_channels_add_mode"):
+        if text.lower() in {"back", "cancel"}:
+            context.user_data["forced_channels_add_mode"] = False
+            await update.message.reply_text(
+                "Forced channel add cancelled.",
+                reply_markup=admin_menu(),
+            )
+            return
+
+        data = load_data()
+        channels = get_all_required_channels(data)
+        if len(channels) >= 5:
+            context.user_data["forced_channels_add_mode"] = False
+            await update.message.reply_text(
+                "You already have the maximum of 5 forced channels.",
+                reply_markup=admin_menu(),
+            )
+            return
+
+        channel, error = parse_forced_channel_input(text)
+        if error:
+            await update.message.reply_text(error)
+            return
+
+        assert channel is not None
+        duplicate_keys = {str(ch.get("chat_id")) for ch in channels}
+        if str(channel.get("chat_id")) in duplicate_keys:
+            await update.message.reply_text(
+                "This channel is already added. Send another one or type Back to cancel.",
+            )
+            return
+
+        forced_channels = get_forced_channels(data)
+        if len(forced_channels) + (1 if legacy_required_channel_entry() else 0) >= 5:
+            context.user_data["forced_channels_add_mode"] = False
+            await update.message.reply_text(
+                "You already have the maximum of 5 forced channels.",
+                reply_markup=admin_menu(),
+            )
+            return
+
+        forced_channels.append(channel)
+        data["forced_channels"] = forced_channels
+        save_data(data)
+        context.user_data["forced_channels_add_mode"] = False
+
+        await update.message.reply_text(
+            build_forced_channels_text(data),
+            reply_markup=build_forced_channels_keyboard(data),
+        )
+        return
+
     # Admin menu buttons
     if is_admin(user_id):
         if text == "Admin Dashboard":
@@ -927,6 +1214,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         if text == "Broadcast":
             await broadcast_command(update, context)
+            return
+        if text == "Forced Channels":
+            await show_forced_channels_panel(update, context)
             return
 
     # Admin broadcast mode
