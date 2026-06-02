@@ -46,7 +46,7 @@ DATA_FILE = Path("/data/data.json")
 
 if not DATA_FILE.exists():
     DATA_FILE.write_text(
-        '{"users":{},"videos":[],"welcome_image_file_id":null,"forced_channels":[],"welcome_messages":[]}',
+        '{"users":{},"videos":[],"welcome_image_file_id":null,"welcome_messages":[],"buy_points_link":null,"forced_channels":[]}',
         encoding="utf-8"
     )
 logging.basicConfig(
@@ -107,40 +107,55 @@ def timestamp() -> str:
 # STORAGE
 # =====================
 
+
+
 def load_data() -> Dict[str, Any]:
+    default = {
+        "users": {},
+        "videos": [],
+        "welcome_image_file_id": None,
+        "welcome_messages": [],
+        "buy_points_link": None,
+        "forced_channels": [],
+    }
     if not DATA_FILE.exists():
-        return {"users": {}, "videos": [], "welcome_image_file_id": None, "forced_channels": [], "welcome_messages": []}
+        return default.copy()
     try:
         with DATA_FILE.open("r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
-            return {"users": {}, "videos": [], "welcome_image_file_id": None, "forced_channels": [], "welcome_messages": []}
+            return default.copy()
         if "users" not in data or not isinstance(data["users"], dict):
             data["users"] = {}
         if "videos" not in data or not isinstance(data["videos"], list):
             data["videos"] = []
         if "welcome_image_file_id" not in data:
             data["welcome_image_file_id"] = None
+        if "welcome_messages" not in data or not isinstance(data["welcome_messages"], list):
+            data["welcome_messages"] = []
+        if "buy_points_link" not in data:
+            data["buy_points_link"] = None
         if "forced_channels" not in data or not isinstance(data["forced_channels"], list):
             data["forced_channels"] = []
         return data
     except Exception as exc:
         logger.warning("Failed to read data.json: %s", exc)
-        return {"users": {}, "videos": [], "welcome_image_file_id": None, "forced_channels": [], "welcome_messages": []}
+        return default.copy()
 
 
 def save_data(data: Dict[str, Any]) -> None:
     if "welcome_image_file_id" not in data:
         data["welcome_image_file_id"] = None
-    if "forced_channels" not in data or not isinstance(data["forced_channels"], list):
-        data["forced_channels"] = []
     if "welcome_messages" not in data or not isinstance(data["welcome_messages"], list):
         data["welcome_messages"] = []
+    if "buy_points_link" not in data:
+        data["buy_points_link"] = None
+    if "forced_channels" not in data or not isinstance(data["forced_channels"], list):
+        data["forced_channels"] = []
     tmp = DATA_FILE.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     tmp.replace(DATA_FILE)
-
 
 def get_users(data: Dict[str, Any]) -> Dict[str, Any]:
     data.setdefault("users", {})
@@ -156,6 +171,31 @@ def get_welcome_image_file_id(data: Dict[str, Any]) -> str | None:
     return data.get("welcome_image_file_id")
 
 
+
+
+
+
+
+
+def normalize_buy_points_link(value: str) -> str | None:
+    value = str(value or "").strip()
+    if not value:
+        return None
+    if value.startswith("http://") or value.startswith("https://"):
+        return value
+    if value.startswith("@"):
+        return f"https://t.me/{value.lstrip('@')}"
+    return None
+
+
+def get_buy_points_link(data: Dict[str, Any]) -> str | None:
+    return normalize_buy_points_link(str(data.get("buy_points_link") or "").strip())
+
+
+def set_buy_points_link(data: Dict[str, Any], value: str | None) -> None:
+    data["buy_points_link"] = normalize_buy_points_link(value or "")
+
+
 def get_welcome_messages(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     messages = data.setdefault("welcome_messages", [])
     if not isinstance(messages, list):
@@ -166,82 +206,128 @@ def get_welcome_messages(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     for item in messages:
         if not isinstance(item, dict):
             continue
-        msg_type = str(item.get("type") or "").strip().lower()
-        if msg_type not in {"text", "photo", "video"}:
-            continue
-        normalized.append(
-            {
-                "type": msg_type,
-                "text": str(item.get("text") or "").strip(),
-                "file_id": str(item.get("file_id") or "").strip() or None,
-                "caption": str(item.get("caption") or "").strip() or None,
-            }
-        )
+        kind = str(item.get("kind") or item.get("type") or "text").strip().lower()
+        if kind in {"gif", "animation"}:
+            kind = "animation"
+        elif kind not in {"text", "photo", "video", "animation"}:
+            kind = "text"
+
+        entry: Dict[str, Any] = {
+            "id": str(item.get("id") or f"welcome_{len(normalized) + 1}"),
+            "kind": kind,
+            "added_at": str(item.get("added_at") or timestamp()),
+        }
+
+        if kind == "text":
+            text = str(item.get("text") or item.get("caption") or "").strip()
+            if not text:
+                continue
+            entry["text"] = text
+        else:
+            file_id = str(item.get("file_id") or "").strip()
+            if not file_id:
+                continue
+            entry["file_id"] = file_id
+            caption = str(item.get("caption") or "").strip()
+            if caption:
+                entry["caption"] = caption
+
+        normalized.append(entry)
 
     data["welcome_messages"] = normalized
     return normalized
 
 
-def build_welcome_messages_text(data: Dict[str, Any]) -> str:
-    items = get_welcome_messages(data)
-    if not items:
-        return "💌 Welcome Messages\n\nNo welcome messages saved yet.\nUse ➕ Add Welcome Message to create one."
+def save_welcome_message(data: Dict[str, Any], kind: str, content: str, caption: str | None = None) -> None:
+    messages = get_welcome_messages(data)
+    entry: Dict[str, Any] = {
+        "id": f"welcome_{len(messages) + 1}_{int(datetime.now().timestamp())}",
+        "kind": kind,
+        "added_at": timestamp(),
+    }
+    if kind == "text":
+        entry["text"] = content.strip()
+    else:
+        entry["file_id"] = content.strip()
+        if caption and caption.strip():
+            entry["caption"] = caption.strip()
+    messages.append(entry)
+    data["welcome_messages"] = messages
 
-    lines = ["💌 Welcome Messages", "", f"Total saved messages: {len(items)}", ""]
-    for idx, item in enumerate(items, start=1):
-        if item["type"] == "text":
-            preview = item["text"][:60] or "(empty text)"
-        elif item["type"] == "photo":
-            preview = "🖼 Photo welcome message"
-        else:
-            preview = "🎥 Video welcome message"
-        lines.append(f"{idx}. {preview}")
+
+def format_welcome_message_preview(entry: Dict[str, Any], index: int) -> str:
+    kind = str(entry.get("kind") or "text")
+    label = {
+        "text": "📝 Text",
+        "photo": "🖼 Photo",
+        "video": "🎞 Video",
+        "animation": "🎬 GIF",
+    }.get(kind, "📝 Text")
+    text = entry.get("text") or entry.get("caption") or entry.get("file_id") or ""
+    text = str(text).strip()
+    if len(text) > 55:
+        text = text[:52] + "..."
+    return f"{index}. {label} — {text}" if text else f"{index}. {label}"
+
+
+def build_welcome_messages_text(data: Dict[str, Any]) -> str:
+    messages = get_welcome_messages(data)
+    if not messages:
+        return (
+            "📋 Welcome Messages\n\n"
+            "No welcome messages saved yet.\n"
+            "Use ➕ Add Welcome Message to create one."
+        )
+
+    lines = ["📋 Welcome Messages", "", f"Total: {len(messages)}", ""]
+    for idx, entry in enumerate(messages, start=1):
+        lines.append(format_welcome_message_preview(entry, idx))
     lines.append("")
-    lines.append("These are sent after the main welcome message.")
+    lines.append("Send the number after choosing 🗑 Remove Welcome Message.")
     return "\n".join(lines)
 
 
-def build_welcome_messages_keyboard(data: Dict[str, Any]) -> InlineKeyboardMarkup:
-    items = get_welcome_messages(data)
-    buttons: List[List[InlineKeyboardButton]] = [
-        [InlineKeyboardButton("➕ Add Welcome Message", callback_data="welcome_messages_add")],
-        [InlineKeyboardButton("📋 List Welcome Messages", callback_data="welcome_messages_list")],
-        [InlineKeyboardButton("🗑 Remove Last Message", callback_data="welcome_messages_remove_last")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="welcome_messages_back")],
-    ]
-    if items:
-        buttons.insert(1, [InlineKeyboardButton(f"✨ Current Count: {len(items)}", callback_data="welcome_messages_list")])
-    return InlineKeyboardMarkup(buttons)
+def build_buy_points_text(data: Dict[str, Any]) -> str:
+    link = get_buy_points_link(data)
+    if link:
+        return f"💎 Buy Points Link\n\n{link}"
+    return "💎 Buy Points Link\n\nNo link is set yet."
 
 
-async def send_welcome_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int, data: Dict[str, Any]) -> None:
-    items = get_welcome_messages(data)
-    if not items:
-        return
-
-    for idx, item in enumerate(items, start=1):
-        try:
-            if item["type"] == "text":
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"✨ {item['text']}",
-                )
-            elif item["type"] == "photo" and item.get("file_id"):
-                await context.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=item["file_id"],
-                    caption=item.get("caption") or "🖼 Welcome pic",
-                )
-            elif item["type"] == "video" and item.get("file_id"):
-                await context.bot.send_video(
-                    chat_id=chat_id,
-                    video=item["file_id"],
-                    caption=item.get("caption") or "🎥 Welcome clip",
-                )
-        except Exception as exc:
-            logger.warning("Failed to send welcome message %s: %s", idx, exc)
+def build_buy_points_markup(data: Dict[str, Any]) -> InlineKeyboardMarkup | None:
+    link = get_buy_points_link(data)
+    if link:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("💎 Buy Points", url=link)]])
+    return None
 
 
+def build_zero_points_markup(data: Dict[str, Any]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = [[InlineKeyboardButton("👥 Refer Friends", callback_data="refer")]]
+    link = get_buy_points_link(data)
+    if link:
+        rows.append([InlineKeyboardButton("💎 Buy Points", url=link)])
+    else:
+        rows.append([InlineKeyboardButton("💎 Buy Points", callback_data="buy_points_info")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_how_to_use_text() -> str:
+    return (
+        "✨ How To Use\n\n"
+        "1️⃣ Join channels\n"
+        "2️⃣ Get free points\n"
+        "3️⃣ Use 🎬 GET VIDEO 🎬\n"
+        "4️⃣ Refer friends\n"
+        "5️⃣ Earn more points"
+    )
+
+
+def build_start_intro_text(username: str, points: int) -> str:
+    return (
+        f"👋 Welcome, {username}!\n\n"
+        f"⭐ Your points: {points}\n"
+        "Use the buttons below to continue."
+    )
 def get_forced_channels(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     channels = data.setdefault("forced_channels", [])
     if not isinstance(channels, list):
@@ -266,6 +352,8 @@ def get_forced_channels(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return normalized
 
 
+
+
 def legacy_required_channel_entry() -> Dict[str, Any] | None:
     if not REQUIRED_CHAT_ID:
         return None
@@ -275,10 +363,9 @@ def legacy_required_channel_entry() -> Dict[str, Any] | None:
         link = f"https://t.me/{REQUIRED_CHAT_ID.lstrip('@')}"
     return {
         "chat_id": REQUIRED_CHAT_ID,
-        "title": "Main Forced Channel",
+        "title": "Main Join Channel",
         "link": link or None,
     }
-
 
 def normalize_channel_chat_id(value: str) -> int | str:
     value = value.strip()
@@ -388,6 +475,8 @@ def parse_forced_channel_input(raw: str) -> tuple[Dict[str, Any] | None, str | N
     )
 
 
+
+
 def build_forced_channels_keyboard(data: Dict[str, Any]) -> InlineKeyboardMarkup:
     channels = get_all_required_channels(data)
     buttons: List[List[InlineKeyboardButton]] = []
@@ -400,15 +489,15 @@ def build_forced_channels_keyboard(data: Dict[str, Any]) -> InlineKeyboardMarkup
         else:
             buttons.append([InlineKeyboardButton(label, callback_data="no_join_link")])
 
-    buttons.append([InlineKeyboardButton("Add Channel", callback_data="forced_channels_add")])
-    buttons.append([InlineKeyboardButton("Back", callback_data="forced_channels_back")])
+    buttons.append([InlineKeyboardButton("➕ Add Channel", callback_data="forced_channels_add")])
+    buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="forced_channels_back")])
     return InlineKeyboardMarkup(buttons)
 
 
 def build_forced_channels_text(data: Dict[str, Any]) -> str:
     channels = get_all_required_channels(data)
     if not channels:
-        return "🔗 Join Channels\n\nNo join channels are configured yet.\nUse Add Channel to add up to 5 channels."
+        return "🔗 Join Channels\n\nNo join channels are configured yet.\nUse ➕ Add Channel to add up to 5 channels."
 
     lines = ["🔗 Join Channels", "", f"Total required channels: {len(channels)}/5", ""]
     for idx, channel in enumerate(channels, start=1):
@@ -416,7 +505,6 @@ def build_forced_channels_text(data: Dict[str, Any]) -> str:
     lines.append("")
     lines.append("Users must join all of them before using the bot.")
     return "\n".join(lines)
-
 
 def get_user(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
     users = get_users(data)
@@ -501,12 +589,15 @@ async def is_member(context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: i
     return True
 
 
+
+
 def user_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("📊 Dashboard"), KeyboardButton("🎬 Get Video 🎬")],
-            [KeyboardButton("⭐ My Points"), KeyboardButton("👥 Refer & Earn")],
-            [KeyboardButton("🎁 Daily Bonus"), KeyboardButton("❓ Help")],
+            [KeyboardButton("🎬 GET VIDEO 🎬")],
+            [KeyboardButton("👤 Dashboard"), KeyboardButton("⭐ My Points")],
+            [KeyboardButton("👥 Refer & Earn"), KeyboardButton("🎁 Daily Bonus")],
+            [KeyboardButton("❓ Help"), KeyboardButton("💎 Buy Points")],
         ],
         resize_keyboard=True,
     )
@@ -515,10 +606,12 @@ def user_menu() -> ReplyKeyboardMarkup:
 def admin_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("🛠 Admin Dashboard"), KeyboardButton("🖼 Set Welcome Image")],
-            [KeyboardButton("➕ Add Video"), KeyboardButton("📋 List Videos")],
-            [KeyboardButton("📣 Broadcast"), KeyboardButton("🔗 Join Channels")],
-            [KeyboardButton("💌 Welcome Messages")],
+            [KeyboardButton("🛠 Admin Dashboard"), KeyboardButton("📢 Broadcast")],
+            [KeyboardButton("🖼 Set Welcome Image"), KeyboardButton("➕ Add Video")],
+            [KeyboardButton("📋 List Videos"), KeyboardButton("🔗 Join Channels")],
+            [KeyboardButton("➕ Add Welcome Message"), KeyboardButton("🗑 Remove Welcome Message")],
+            [KeyboardButton("📋 List Welcome Messages"), KeyboardButton("💎 Set Buy Points Link")],
+            [KeyboardButton("👀 View Buy Points Link"), KeyboardButton("❌ Remove Buy Points Link")],
         ],
         resize_keyboard=True,
     )
@@ -532,27 +625,27 @@ def join_keyboard() -> InlineKeyboardMarkup:
     if channels:
         for idx, channel in enumerate(channels, start=1):
             link = channel_join_link(channel)
-            label = f"Join {channel_label(channel, idx)}"
+            label = f"🔗 Join {channel_label(channel, idx)}"
             if link:
                 buttons.append([InlineKeyboardButton(label, url=link)])
             else:
                 buttons.append([InlineKeyboardButton(label, callback_data="no_join_link")])
     else:
         if REQUIRED_CHAT_LINK:
-            buttons.append([InlineKeyboardButton("Join Channel / Group", url=REQUIRED_CHAT_LINK)])
+            buttons.append([InlineKeyboardButton("🔗 Join Channel / Group", url=REQUIRED_CHAT_LINK)])
         elif isinstance(REQUIRED_CHAT_ID, str) and REQUIRED_CHAT_ID.startswith("@"):
             buttons.append(
-                [InlineKeyboardButton("Join Channel / Group", url=f"https://t.me/{REQUIRED_CHAT_ID.lstrip('@')}")]
+                [InlineKeyboardButton("🔗 Join Channel / Group", url=f"https://t.me/{REQUIRED_CHAT_ID.lstrip('@')}")]
             )
         else:
-            buttons.append([InlineKeyboardButton("Join Channel / Group", callback_data="no_join_link")])
+            buttons.append([InlineKeyboardButton("🔗 Join Channel / Group", callback_data="no_join_link")])
 
-    buttons.append([InlineKeyboardButton("I Joined", callback_data="check_join")])
+    buttons.append([InlineKeyboardButton("✅ I Joined", callback_data="check_join")])
     return InlineKeyboardMarkup(buttons)
 
 
 def referral_share_markup(referral_link: str) -> InlineKeyboardMarkup:
-    share_url = f"https://t.me/share/url?{urlencode({'url': referral_link, 'text': 'Join and earn free videos'})}"
+    share_url = f"https://t.me/share/url?{urlencode({'url': referral_link, 'text': 'Join and earn free points 💎'})}"
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📤 Share Referral", url=share_url)]
@@ -562,7 +655,7 @@ def referral_share_markup(referral_link: str) -> InlineKeyboardMarkup:
 
 def get_refer_button_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Refer to earn more points", callback_data="refer")]]
+        [[InlineKeyboardButton("👥 Refer & Earn", callback_data="refer")]]
     )
 
 
@@ -570,14 +663,22 @@ async def send_join_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     data = load_data()
     channels = get_all_required_channels(data)
     if channels:
-        lines = ["You must join all required channels/groups first to use this bot.", "", "Join all of these, then press I Joined:", ""]
+        lines = [
+            "🔐 Access Required",
+            "",
+            "Please join all required channels/groups first.",
+            "",
+            "After joining, press ✅ I Joined:",
+            "",
+        ]
         for idx, channel in enumerate(channels, start=1):
             lines.append(f"{idx}. {channel_label(channel, idx)}")
         text = "\n".join(lines)
     else:
         text = (
-            "You must join our channel/group first to use this bot.\n\n"
-            "After joining, press I Joined."
+            "🔐 Access Required\n\n"
+            "Please join our channel/group first to use this bot.\n\n"
+            "After joining, press ✅ I Joined."
         )
 
     if update.message:
@@ -588,41 +689,53 @@ async def send_join_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def send_welcome_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE, username: str) -> None:
     data = load_data()
-    welcome_image_file_id = get_welcome_image_file_id(data)
     points = get_user(data, update.effective_user.id).get("points", 0)
-    user_id = update.effective_user.id
+    welcome_messages = get_welcome_messages(data)
+    legacy_welcome_image_file_id = get_welcome_image_file_id(data)
 
-    text = (
-        f"🌸 Welcome, {username}! 😘\n\n"
-        f"⭐ Your points: {points}\n"
-        "Use the menu below to continue."
-    )
+    if update.message is None:
+        return
 
-    if welcome_image_file_id:
+    sent_custom_content = False
+
+    if welcome_messages:
+        for entry in welcome_messages:
+            kind = entry.get("kind", "text")
+            try:
+                if kind == "text":
+                    await update.message.reply_text(str(entry.get("text") or ""))
+                elif kind == "photo":
+                    await update.message.reply_photo(
+                        photo=entry["file_id"],
+                        caption=entry.get("caption") or None,
+                    )
+                elif kind == "video":
+                    await update.message.reply_video(
+                        video=entry["file_id"],
+                        caption=entry.get("caption") or None,
+                    )
+                elif kind == "animation":
+                    await update.message.reply_animation(
+                        animation=entry["file_id"],
+                        caption=entry.get("caption") or None,
+                    )
+                sent_custom_content = True
+            except Exception as exc:
+                logger.warning("Failed to send welcome message item: %s", exc)
+    elif legacy_welcome_image_file_id:
         try:
             await update.message.reply_photo(
-                photo=welcome_image_file_id,
-                caption=text,
-                reply_markup=menu_for_user(user_id),
+                photo=legacy_welcome_image_file_id,
+                caption=build_start_intro_text(username, points),
             )
+            sent_custom_content = True
         except Exception as exc:
             logger.warning("Failed to send welcome image: %s", exc)
-            await update.message.reply_text(text, reply_markup=menu_for_user(user_id))
-    else:
-        await update.message.reply_text(text, reply_markup=menu_for_user(user_id))
 
-    how_to_use = (
-        "🪄 How to use this bot:\n\n"
-        "1️⃣ Join the channels shown above.\n"
-        "2️⃣ Claim 🎁 Daily Bonus for free points.\n"
-        "3️⃣ Use 🎬 Get Video to unlock the next clip.\n"
-        "4️⃣ Refer friends to earn more points and keep the fun going.\n"
-        "5️⃣ When points hit zero, refer more or buy points later if enabled. 💎"
-    )
-    await context.bot.send_message(chat_id=user_id, text=how_to_use)
+    if not sent_custom_content and not welcome_messages:
+        await update.message.reply_text(build_start_intro_text(username, points))
 
-    await send_welcome_messages(context, user_id, data)
-
+    await update.message.reply_text(build_how_to_use_text(), reply_markup=menu_for_user(update.effective_user.id))
 
 async def delete_sent_message(context: ContextTypes.DEFAULT_TYPE) -> None:
     job = context.job
@@ -641,6 +754,8 @@ async def delete_sent_message(context: ContextTypes.DEFAULT_TYPE) -> None:
             chat_id,
             exc,
         )
+
+
 
 
 async def activate_user_if_needed(
@@ -673,10 +788,11 @@ async def activate_user_if_needed(
                     await context.bot.send_message(
                         chat_id=referrer_id,
                         text=(
-                            "🎉 New Referral Joined!\n\n"
-                            f"You earned {REFERRER_BONUS} points.\n"
-                            f"Current referrals: {referrer['referred_count']}\n"
-                            f"Current points: {referrer['points']}"
+                            "🎉 Referral Success!\n\n"
+                            "Your friend just joined through your link.\n"
+                            f"💎 +{REFERRER_BONUS} points added.\n"
+                            f"👥 Total referrals: {referrer['referred_count']}\n"
+                            f"⭐ Current points: {referrer['points']}"
                         ),
                     )
                 except Exception as e:
@@ -687,7 +803,6 @@ async def activate_user_if_needed(
                     )
         except Exception:
             logger.warning("Invalid pending_referrer for user %s", user_id)
-
 
     user["pending_referrer"] = None
     save_data(data)
@@ -712,15 +827,14 @@ async def apply_referral_milestone_reward(data: Dict[str, Any], context: Context
         await context.bot.send_message(
             chat_id=user_id,
             text=(
-                f"🎉 Milestone unlocked!\n\n"
+                f"🏆 Referral Milestone Unlocked!\n\n"
                 f"You reached {earned_levels * 5} referrals.\n"
-                f"💎 Bonus points added: {bonus}\n"
+                f"🎁 Bonus points added: +{bonus}\n"
                 f"⭐ Total points: {user['points']}"
             ),
         )
     except Exception as exc:
         logger.warning("Failed to notify milestone reward for %s: %s", user_id, exc)
-
 
 async def ensure_joined_or_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not update.effective_user:
@@ -745,6 +859,8 @@ async def ensure_joined_or_gate(update: Update, context: ContextTypes.DEFAULT_TY
 # DASHBOARDS
 # =====================
 
+
+
 def build_user_dashboard(user: Dict[str, Any], total_videos: int) -> str:
     points = int(user.get("points", 0))
     referrals = int(user.get("referred_count", 0))
@@ -763,18 +879,21 @@ def build_user_dashboard(user: Dict[str, Any], total_videos: int) -> str:
         lines.append(f"📺 Next video number: {next_video}")
 
     lines.append("")
-    if points < VIDEO_COST:
-        lines.append("You are out of points right now.")
-        lines.append("Refer friends to earn more points and unlock more videos.")
-        lines.append("Every successful referral gives you 2 points.")
+    if points <= 0:
+        lines.append("😢 Oops! You have no points left.")
+        lines.append("👥 Refer friends to earn more points.")
+        lines.append("💎 Buy points to unlock videos instantly.")
+    elif points < VIDEO_COST:
+        lines.append("😢 You do not have enough points right now.")
+        lines.append("👥 Refer friends to earn more points.")
+        lines.append("💎 Buy points to unlock videos instantly.")
     else:
-        lines.append(f"You can unlock {points // VIDEO_COST} more video request(s) right now.")
+        lines.append(f"✅ You can unlock {points // VIDEO_COST} more video request(s) right now.")
         lines.append("Keep your points moving by inviting more people.")
 
     lines.append("")
-    lines.append("Simple path: join, refer, earn, unlock.")
+    lines.append("✨ Simple path: join → earn → watch → refer → repeat.")
     return "\n".join(lines)
-
 
 def build_admin_dashboard(data: Dict[str, Any]) -> str:
     users = get_users(data)
@@ -811,11 +930,11 @@ async def send_all_videos_to_admin(update: Update, context: ContextTypes.DEFAULT
 
     if not videos:
         if message:
-            await message.reply_text("Saved videos: 0")
+            await message.reply_text("🎞 🎞 Saved videos: 0")
         return
 
     if message:
-        await message.reply_text(f"Saved videos: {len(videos)}")
+        await message.reply_text(f"🎞 🎞 Saved videos: {len(videos)}")
 
     if len(videos) == 1:
         try:
@@ -848,6 +967,8 @@ async def send_all_videos_to_admin(update: Update, context: ContextTypes.DEFAULT
                     logger.warning("Failed to send video %s: %s", video.get("title"), exc2)
 
 
+
+
 async def send_referral_message(message, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
     bot_username = (await context.bot.get_me()).username
     referral_link = f"https://t.me/{bot_username}?start={user_id}"
@@ -855,11 +976,16 @@ async def send_referral_message(message, context: ContextTypes.DEFAULT_TYPE, use
     user = get_user(data, user_id)
     save_data(data)
 
+    text = (
+        "😘 Hey there!\n\n"
+        "Invite your friends and earn more points ❤️\n\n"
+        f"🔗 🔗 Your referral link:\n{referral_link}\n\n"
+        f"⭐ Current points: {user['points']}\n"
+        f"🎁 You get {REFERRER_BONUS} points for every successful referral."
+    )
+
     await message.reply_text(
-        f"Your referral link:\n{referral_link}\n\n"
-        f"You have {user['points']} points right now.\n"
-        f"Invite one friend and you get 2 points.\n"
-        f"Keep sharing until the videos keep flowing automatically.",
+        text,
         reply_markup=referral_share_markup(referral_link),
     )
 
@@ -871,16 +997,15 @@ async def send_next_video(message, context: ContextTypes.DEFAULT_TYPE, user_id: 
 
     if not videos:
         await message.reply_text(
-            "No videos have been added yet. Admin must add videos first.",
+            "🎬 No videos have been added yet. Admin must add videos first.",
             reply_markup=menu_for_user(user_id),
         )
         return
 
     if user["points"] < VIDEO_COST:
         await message.reply_text(
-            "You do not have enough points. Refer friends to earn more.\n\n"
-            "Each successful referral gives you 2 points.",
-            reply_markup=menu_for_user(user_id),
+            "😢 Oops! You have no points left.",
+            reply_markup=build_zero_points_markup(data),
         )
         return
 
@@ -895,7 +1020,8 @@ async def send_next_video(message, context: ContextTypes.DEFAULT_TYPE, user_id: 
         sent_message = await message.reply_video(
             video=video["file_id"],
             caption=(
-                f"Points left: {user['points']}\n\n"
+                f"🎬 Here is your video!\n\n"
+                f"⭐ Points left: {user['points']}\n\n"
                 "Forward or save this video; it will be deleted after 5 minutes."
             ),
             reply_markup=get_refer_button_markup(),
@@ -913,14 +1039,14 @@ async def send_next_video(message, context: ContextTypes.DEFAULT_TYPE, user_id: 
     except Exception as exc:
         logger.warning("Failed to send saved video: %s", exc)
         await message.reply_text(
-            "I could not send that video file. Admin may need to re-upload it.",
+            "⚠️ I could not send that video file. Admin may need to re-upload it.",
             reply_markup=menu_for_user(user_id),
         )
-
 
 # =====================
 # USER ACTIONS
 # =====================
+
 
 async def do_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
@@ -935,6 +1061,7 @@ async def do_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(text, reply_markup=menu_for_user(update.effective_user.id))
 
 
+
 async def do_points(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
@@ -943,12 +1070,20 @@ async def do_points(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     data = load_data()
     user = get_user(data, update.effective_user.id)
+    points = int(user.get("points", 0))
     save_data(data)
+
+    if points <= 0:
+        await update.message.reply_text(
+            "😢 Oops! You have no points left.",
+            reply_markup=build_zero_points_markup(data),
+        )
+        return
+
     await update.message.reply_text(
-        f"Your points: {user['points']}",
+        f"⭐ Your points: {points}",
         reply_markup=menu_for_user(update.effective_user.id),
     )
-
 
 async def do_refer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
@@ -966,6 +1101,8 @@ async def do_get_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     await send_next_video(update.message, context, update.effective_user.id)
+
+
 
 
 async def do_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -994,7 +1131,6 @@ async def do_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         reply_markup=menu_for_user(update.effective_user.id),
     )
 
-
 async def show_forced_channels_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
@@ -1005,19 +1141,6 @@ async def show_forced_channels_panel(update: Update, context: ContextTypes.DEFAU
     await update.message.reply_text(
         build_forced_channels_text(data),
         reply_markup=build_forced_channels_keyboard(data),
-    )
-
-
-async def show_welcome_messages_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
-        return
-    if not is_admin(update.effective_user.id):
-        return
-
-    data = load_data()
-    await update.message.reply_text(
-        build_welcome_messages_text(data),
-        reply_markup=build_welcome_messages_keyboard(data),
     )
 
 
@@ -1073,20 +1196,21 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await do_dashboard(update, context)
 
 
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
 
     help_text = (
         "❓ Help Center\n\n"
-        "Having trouble using the bot?\n\n"
-        "📩 For direct videos or any issue contact:\n"
-        "@jainsahiba18\n\n"
-        "⚡ Earn points by referring friends.\n"
-        "🎬 Use points to unlock videos.\n"
-        "🔄 If a video does not arrive, try again after a few seconds.\n"
-        "📢 Stay joined in the channel/group to continue using the bot.\n\n"
-        "Thank you for using our bot."
+        "Need help using the bot?\n\n"
+        "📩 Contact: @jainsahiba18\n\n"
+        "✨ Use 🎬 GET VIDEO 🎬 to unlock videos.\n"
+        "👥 Refer friends to earn more points.\n"
+        "🎁 Claim Daily Bonus once every 24 hours.\n"
+        "🔄 Stay joined in the required channels to keep using the bot.\n\n"
+        "Thank you for using our bot ❤️"
     )
 
     if is_admin(update.effective_user.id):
@@ -1115,7 +1239,7 @@ async def add_video_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     context.user_data["add_video_mode"] = True
     await update.message.reply_text(
-        "Send me a video now. I will save its Telegram file_id, so you do not need local storage.",
+        "🎞 Send me a video now. I will save its Telegram file_id, so you do not need local storage.",
         reply_markup=admin_menu(),
     )
 
@@ -1137,7 +1261,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     context.user_data["broadcast_mode"] = True
     await update.message.reply_text(
-        "Send the message you want to broadcast to all users.",
+        "📢 Send the message you want to broadcast to all users.",
         reply_markup=admin_menu(),
     )
 
@@ -1150,14 +1274,104 @@ async def set_welcome_image_command(update: Update, context: ContextTypes.DEFAUL
 
     context.user_data["set_welcome_image_mode"] = True
     await update.message.reply_text(
-        "Send the welcome image now. I will save it and use it on /start.",
+        "🖼 Send the welcome image now. I will save it and use it on /start.",
         reply_markup=admin_menu(),
     )
 
 
+
+
+async def add_welcome_message_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        return
+
+    context.user_data["welcome_message_mode"] = "add"
+    await update.message.reply_text(
+        "➕ Send a welcome message now. You can send text, photo, video, or GIF.",
+        reply_markup=admin_menu(),
+    )
+
+
+async def remove_welcome_message_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        return
+
+    context.user_data["welcome_message_mode"] = "remove"
+    data = load_data()
+    await update.message.reply_text(
+        build_welcome_messages_text(data) + "\n\nSend the number to remove, or type ALL to clear everything.",
+        reply_markup=admin_menu(),
+    )
+
+
+async def list_welcome_messages_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        return
+
+    data = load_data()
+    await update.message.reply_text(
+        build_welcome_messages_text(data),
+        reply_markup=admin_menu(),
+    )
+
+
+async def set_buy_points_link_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        return
+
+    context.user_data["buy_points_link_mode"] = "set"
+    await update.message.reply_text(
+        "💎 Send the buy points link now.",
+        reply_markup=admin_menu(),
+    )
+
+
+async def view_buy_points_link_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        return
+
+    data = load_data()
+    link = get_buy_points_link(data)
+    if link:
+        await update.message.reply_text(
+            f"👀 Current Buy Points Link:\n{link}",
+            reply_markup=admin_menu(),
+        )
+    else:
+        await update.message.reply_text(
+            "👀 No buy points link is set yet.",
+            reply_markup=admin_menu(),
+        )
+
+
+async def remove_buy_points_link_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        return
+
+    data = load_data()
+    data["buy_points_link"] = None
+    save_data(data)
+    await update.message.reply_text(
+        "❌ Buy points link removed.",
+        reply_markup=admin_menu(),
+    )
 # =====================
 # CALLBACK HANDLER
 # =====================
+
+
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.callback_query or not update.effective_user or not update.callback_query.message:
@@ -1168,7 +1382,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
 
     if query.data == "no_join_link":
-        await query.message.reply_text("Set REQUIRED_CHAT_LINK for the join button if the group/channel is private.")
+        await query.message.reply_text("⚠️ Set REQUIRED_CHAT_LINK for the join button if the group/channel is private.")
         return
 
     if query.data == "check_join":
@@ -1179,12 +1393,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             user = get_user(data, user_id)
             save_data(data)
             await query.message.reply_text(
-                f"Verified. You can now use the bot.\n\nPoints: {user['points']}",
+                f"✅ ✅ Verified. You can now use the bot.\n\n⭐ Points: {user['points']}",
                 reply_markup=menu_for_user(user_id),
             )
         else:
             await query.message.reply_text(
-                "You still have not joined. Join first, then press again.",
+                "⚠️ You still have not joined. Join first, then press again.",
                 reply_markup=join_keyboard(),
             )
         return
@@ -1199,7 +1413,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if query.data == "set_welcome_image" and is_admin(user_id):
         context.user_data["set_welcome_image_mode"] = True
         await query.message.reply_text(
-            "Send the welcome image now. I will save it and use it on /start.",
+            "🖼 Send the welcome image now. I will save it and use it on /start.",
             reply_markup=admin_menu(),
         )
         return
@@ -1207,7 +1421,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if query.data == "add_video" and is_admin(user_id):
         context.user_data["add_video_mode"] = True
         await query.message.reply_text(
-            "Send me a video now. I will store its Telegram file_id and use it for future delivery.",
+            "🎞 Send me a video now. I will store its Telegram file_id and use it for future delivery.",
             reply_markup=admin_menu(),
         )
         return
@@ -1219,14 +1433,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if query.data == "admin_broadcast" and is_admin(user_id):
         context.user_data["broadcast_mode"] = True
         await query.message.reply_text(
-            "Send the message you want to broadcast to all users.",
+            "📢 Send the message you want to broadcast to all users.",
             reply_markup=admin_menu(),
         )
         return
 
     if query.data == "forced_channels_back" and is_admin(user_id):
         context.user_data["forced_channels_add_mode"] = False
-        await query.message.reply_text("Back to admin menu.", reply_markup=admin_menu())
+        await query.message.reply_text("⬅️ Back to admin menu.", reply_markup=admin_menu())
         return
 
     if query.data == "forced_channels_add" and is_admin(user_id):
@@ -1251,15 +1465,51 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await send_next_video(query.message, context, user_id)
         return
 
+    if query.data == "buy_points_info":
+        data = load_data()
+        link = get_buy_points_link(data)
+        if link:
+            await query.message.reply_text(
+                f"💎 Buy points here:\n{link}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💎 Buy Points", url=link)]]),
+            )
+        else:
+            await query.message.reply_text(
+                "🚧 Coming Soon\nContact @jainsahiba18",
+            )
+        return
 
 # =====================
 # MESSAGE HANDLERS
 # =====================
 
+
+
 async def handle_admin_photo_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
     if not is_admin(update.effective_user.id):
+        return
+
+    if context.user_data.get("welcome_message_mode") == "add":
+        if update.message.photo:
+            file_id = update.message.photo[-1].file_id
+            data = load_data()
+            save_welcome_message(data, "photo", file_id, update.message.caption)
+            save_data(data)
+            context.user_data["welcome_message_mode"] = None
+            await update.message.reply_text("✅ Welcome photo saved.", reply_markup=admin_menu())
+            return
+        if update.message.animation:
+            file_id = update.message.animation.file_id
+            data = load_data()
+            save_welcome_message(data, "animation", file_id, update.message.caption)
+            save_data(data)
+            context.user_data["welcome_message_mode"] = None
+            await update.message.reply_text("✅ Welcome GIF saved.", reply_markup=admin_menu())
+            return
+
+    if not context.user_data.get("set_welcome_image_mode"):
         return
 
     file_id = None
@@ -1269,26 +1519,7 @@ async def handle_admin_photo_upload(update: Update, context: ContextTypes.DEFAUL
         file_id = update.message.document.file_id
 
     if not file_id:
-        return
-
-    if context.user_data.get("welcome_messages_add_mode"):
-        data = load_data()
-        items = get_welcome_messages(data)
-        items.append(
-            {
-                "type": "photo",
-                "text": "",
-                "file_id": file_id,
-                "caption": update.message.caption or None,
-            }
-        )
-        data["welcome_messages"] = items
-        save_data(data)
-        context.user_data["welcome_messages_add_mode"] = False
-        await update.message.reply_text("💌 Photo welcome message saved!", reply_markup=build_welcome_messages_keyboard(data))
-        return
-
-    if not context.user_data.get("set_welcome_image_mode"):
+        await update.message.reply_text("Please send a valid image.")
         return
 
     data = load_data()
@@ -1297,7 +1528,7 @@ async def handle_admin_photo_upload(update: Update, context: ContextTypes.DEFAUL
     context.user_data["set_welcome_image_mode"] = False
 
     await update.message.reply_text(
-        "🖼 Welcome image saved successfully.",
+        "✅ Welcome image saved successfully.",
         reply_markup=admin_menu(),
     )
 
@@ -1307,6 +1538,25 @@ async def handle_admin_video_upload(update: Update, context: ContextTypes.DEFAUL
         return
     if not is_admin(update.effective_user.id):
         return
+
+    if context.user_data.get("welcome_message_mode") == "add":
+        if update.message.video:
+            file_id = update.message.video.file_id
+            data = load_data()
+            save_welcome_message(data, "video", file_id, update.message.caption)
+            save_data(data)
+            context.user_data["welcome_message_mode"] = None
+            await update.message.reply_text("✅ Welcome video saved.", reply_markup=admin_menu())
+            return
+        if update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("video/"):
+            file_id = update.message.document.file_id
+            data = load_data()
+            save_welcome_message(data, "video", file_id, update.message.caption or update.message.document.file_name)
+            save_data(data)
+            context.user_data["welcome_message_mode"] = None
+            await update.message.reply_text("✅ Welcome video saved.", reply_markup=admin_menu())
+            return
+
     if not context.user_data.get("add_video_mode"):
         return
 
@@ -1337,7 +1587,7 @@ async def handle_admin_video_upload(update: Update, context: ContextTypes.DEFAUL
     context.user_data["add_video_mode"] = False
 
     await update.message.reply_text(
-        f"Saved video #{len(videos)} successfully.\nTotal videos stored: {len(videos)}",
+        f"✅ Saved video #{len(videos)} successfully.\nTotal videos stored: {len(videos)}",
         reply_markup=admin_menu(),
     )
 
@@ -1349,26 +1599,62 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
-    # Welcome messages add mode
-    if is_admin(user_id) and context.user_data.get("welcome_messages_add_mode"):
-        if text.lower() in {"back", "cancel"}:
-            context.user_data["welcome_messages_add_mode"] = False
+    if is_admin(user_id) and context.user_data.get("welcome_message_mode") == "add":
+        data = load_data()
+        save_welcome_message(data, "text", text)
+        save_data(data)
+        context.user_data["welcome_message_mode"] = None
+        await update.message.reply_text(
+            "✅ Welcome text saved.",
+            reply_markup=admin_menu(),
+        )
+        return
+
+    if is_admin(user_id) and context.user_data.get("welcome_message_mode") == "remove":
+        data = load_data()
+        messages = get_welcome_messages(data)
+        if text.lower() in {"all", "clear", "reset"}:
+            data["welcome_messages"] = []
+            save_data(data)
+            context.user_data["welcome_message_mode"] = None
             await update.message.reply_text(
-                "💌 Welcome message add cancelled.",
+                "🗑 All welcome messages removed.",
                 reply_markup=admin_menu(),
             )
             return
 
-        data = load_data()
-        items = get_welcome_messages(data)
-        items.append({"type": "text", "text": text, "file_id": None, "caption": None})
-        data["welcome_messages"] = items
-        save_data(data)
-        context.user_data["welcome_messages_add_mode"] = False
+        try:
+            index = int(text)
+        except ValueError:
+            await update.message.reply_text("Please send a valid number, or ALL.")
+            return
 
+        if index < 1 or index > len(messages):
+            await update.message.reply_text("That number is out of range.")
+            return
+
+        messages.pop(index - 1)
+        data["welcome_messages"] = messages
+        save_data(data)
+        context.user_data["welcome_message_mode"] = None
         await update.message.reply_text(
-            "💌 Welcome message saved!",
-            reply_markup=build_welcome_messages_keyboard(data),
+            build_welcome_messages_text(data),
+            reply_markup=admin_menu(),
+        )
+        return
+
+    if is_admin(user_id) and context.user_data.get("buy_points_link_mode") == "set":
+        data = load_data()
+        link = normalize_buy_points_link(text)
+        if not link:
+            await update.message.reply_text("Please send a valid https:// link or @username.")
+            return
+        set_buy_points_link(data, link)
+        save_data(data)
+        context.user_data["buy_points_link_mode"] = None
+        await update.message.reply_text(
+            f"✅ Buy points link saved:\n{link}",
+            reply_markup=admin_menu(),
         )
         return
 
@@ -1377,7 +1663,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if text.lower() in {"back", "cancel"}:
             context.user_data["forced_channels_add_mode"] = False
             await update.message.reply_text(
-                "🔗 Join channel add cancelled.",
+                "❌ Channel add cancelled.",
                 reply_markup=admin_menu(),
             )
             return
@@ -1387,7 +1673,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if len(channels) >= 5:
             context.user_data["forced_channels_add_mode"] = False
             await update.message.reply_text(
-                "🔗 You already have the maximum of 5 join channels.",
+                "You already have the maximum of 5 join channels.",
                 reply_markup=admin_menu(),
             )
             return
@@ -1409,7 +1695,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if len(forced_channels) + (1 if legacy_required_channel_entry() else 0) >= 5:
             context.user_data["forced_channels_add_mode"] = False
             await update.message.reply_text(
-                "🔗 You already have the maximum of 5 join channels.",
+                "You already have the maximum of 5 join channels.",
                 reply_markup=admin_menu(),
             )
             return
@@ -1425,7 +1711,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # Admin menu buttons
     if is_admin(user_id):
         if text in {"🛠 Admin Dashboard", "Admin Dashboard"}:
             await admin_dashboard(update, context)
@@ -1439,17 +1724,31 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if text in {"📋 List Videos", "List Videos"}:
             await list_videos_command(update, context)
             return
-        if text in {"📣 Broadcast", "Broadcast"}:
+        if text in {"📢 Broadcast", "Broadcast"}:
             await broadcast_command(update, context)
             return
-        if text in {"🔗 Join Channels", "Forced Channels"}:
+        if text in {"🔗 Join Channels", "Join Channels", "Join Channels"}:
             await show_forced_channels_panel(update, context)
             return
-        if text in {"💌 Welcome Messages", "Welcome Messages"}:
-            await show_welcome_messages_panel(update, context)
+        if text == "➕ Add Welcome Message":
+            await add_welcome_message_command(update, context)
+            return
+        if text == "🗑 Remove Welcome Message":
+            await remove_welcome_message_command(update, context)
+            return
+        if text == "📋 List Welcome Messages":
+            await list_welcome_messages_command(update, context)
+            return
+        if text == "💎 Set Buy Points Link":
+            await set_buy_points_link_command(update, context)
+            return
+        if text == "👀 View Buy Points Link":
+            await view_buy_points_link_command(update, context)
+            return
+        if text == "❌ Remove Buy Points Link":
+            await remove_buy_points_link_command(update, context)
             return
 
-    # Admin broadcast mode
     if is_admin(user_id) and context.user_data.get("broadcast_mode"):
         context.user_data["broadcast_mode"] = False
         data = load_data()
@@ -1465,35 +1764,49 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 failed += 1
 
         await update.message.reply_text(
-            f"📣 Broadcast done. Sent: {sent}, Failed: {failed}",
+            f"✅ Broadcast done. Sent: {sent}, Failed: {failed}",
             reply_markup=admin_menu(),
         )
         return
 
-    # User menu buttons
-    if text in {"📊 Dashboard", "Dashboard"}:
-        await do_dashboard(update, context)
-        return
-    if text == "🎬 Get Video 🎬":
+    if text in {"🎬 GET VIDEO 🎬", "Get Video"}:
         await do_get_video(update, context)
         return
-    if text == "⭐ My Points":
+    if text in {"👤 Dashboard", "Dashboard"}:
+        await do_dashboard(update, context)
+        return
+    if text in {"⭐ My Points", "My Points"}:
         await do_points(update, context)
         return
-    if text == "👥 Refer & Earn":
+    if text in {"👥 Refer & Earn", "Refer & Earn"}:
         await do_refer(update, context)
         return
     if text == "🎁 Daily Bonus":
         await do_daily_bonus(update, context)
         return
-    if text == "❓ Help":
+    if text in {"❓ Help", "Help"}:
         await help_command(update, context)
         return
-
+    if text == "💎 Buy Points":
+        data = load_data()
+        link = get_buy_points_link(data)
+        if link:
+            await update.message.reply_text(
+                "💎 Buy Points",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💎 Buy Points", url=link)]]),
+            )
+        else:
+            await update.message.reply_text(
+                "🚧 Coming Soon\nContact @jainsahiba18",
+                reply_markup=menu_for_user(user_id),
+            )
+        return
 
 # =====================
 # APP
 # =====================
+
+
 
 async def post_init(application) -> None:
     await application.bot.set_my_commands(
@@ -1502,10 +1815,9 @@ async def post_init(application) -> None:
             BotCommand("dashboard", "Dashboard"),
             BotCommand("getvideo", "Get video"),
             BotCommand("points", "My points"),
-            BotCommand("help", "❓ Help"),
+            BotCommand("help", "Help"),
         ]
     )
-
 
 def build_app() -> Any:
     if not BOT_TOKEN:
@@ -1535,7 +1847,7 @@ def build_app() -> Any:
     app.add_handler(CommandHandler("setwelcomeimage", set_welcome_image_command))
 
     app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_admin_photo_upload))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE | filters.ANIMATION, handle_admin_photo_upload))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_admin_video_upload))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
