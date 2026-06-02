@@ -341,6 +341,8 @@ def get_user(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
             "referrer": None,
             "pending_referrer": None,
             "referred_count": 0,
+            "milestone_rewards_claimed": 0,
+            "daily_bonus_date": None,
             "video_index": 0,
             "videos_sent": 0,
             "first_seen": None,
@@ -356,6 +358,8 @@ def get_user(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
     user.setdefault("referrer", None)
     user.setdefault("pending_referrer", None)
     user.setdefault("referred_count", 0)
+    user.setdefault("milestone_rewards_claimed", 0)
+    user.setdefault("daily_bonus_date", None)
     user.setdefault("video_index", 0)
     user.setdefault("videos_sent", 0)
     user.setdefault("first_seen", None)
@@ -414,7 +418,7 @@ def user_menu() -> ReplyKeyboardMarkup:
         [
             [KeyboardButton("Dashboard"), KeyboardButton("Get Video")],
             [KeyboardButton("My Points"), KeyboardButton("Refer & Earn")],
-            [KeyboardButton("Help")],
+            [KeyboardButton("🎁 Daily Bonus"), KeyboardButton("Help")],
         ],
         resize_keyboard=True,
     )
@@ -561,6 +565,8 @@ async def activate_user_if_needed(
                 referrer["points"] += REFERRER_BONUS
                 referrer["referred_count"] = int(referrer.get("referred_count", 0)) + 1
 
+                await apply_referral_milestone_reward(data, context, referrer_id)
+
                 try:
                     await context.bot.send_message(
                         chat_id=referrer_id,
@@ -580,8 +586,38 @@ async def activate_user_if_needed(
         except Exception:
             logger.warning("Invalid pending_referrer for user %s", user_id)
 
+
     user["pending_referrer"] = None
     save_data(data)
+
+
+async def apply_referral_milestone_reward(data: Dict[str, Any], context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    user = get_user(data, user_id)
+    referrals = int(user.get("referred_count", 0))
+    claimed = int(user.get("milestone_rewards_claimed", 0))
+    earned_levels = referrals // 5
+
+    if earned_levels <= claimed:
+        return
+
+    new_levels = earned_levels - claimed
+    bonus = new_levels * 3
+    user["points"] += bonus
+    user["milestone_rewards_claimed"] = earned_levels
+    save_data(data)
+
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                f"🎉 Milestone unlocked!\n\n"
+                f"You reached {earned_levels * 5} referrals.\n"
+                f"💎 Bonus points added: {bonus}\n"
+                f"⭐ Total points: {user['points']}"
+            ),
+        )
+    except Exception as exc:
+        logger.warning("Failed to notify milestone reward for %s: %s", user_id, exc)
 
 
 async def ensure_joined_or_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -830,6 +866,33 @@ async def do_get_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await send_next_video(update.message, context, update.effective_user.id)
 
 
+async def do_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not await ensure_joined_or_gate(update, context):
+        return
+
+    data = load_data()
+    user = get_user(data, update.effective_user.id)
+    today = today_key()
+
+    if user.get("daily_bonus_date") == today:
+        await update.message.reply_text(
+            "🎁 Daily bonus already claimed today.\n\nCome back tomorrow for another free point.",
+            reply_markup=menu_for_user(update.effective_user.id),
+        )
+        return
+
+    user["points"] += 1
+    user["daily_bonus_date"] = today
+    save_data(data)
+
+    await update.message.reply_text(
+        f"🎁 Daily bonus claimed!\n\nYou got +1 point.\n⭐ New balance: {user['points']}",
+        reply_markup=menu_for_user(update.effective_user.id),
+    )
+
+
 async def show_forced_channels_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
@@ -885,6 +948,10 @@ async def points(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def refer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await do_refer(update, context)
+
+
+async def daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await do_daily_bonus(update, context)
 
 
 async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1258,6 +1325,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if text == "Refer & Earn":
         await do_refer(update, context)
         return
+    if text == "🎁 Daily Bonus":
+        await do_daily_bonus(update, context)
+        return
     if text == "Help":
         await help_command(update, context)
         return
@@ -1297,6 +1367,7 @@ def build_app() -> Any:
     app.add_handler(CommandHandler("dashboard", dashboard))
     app.add_handler(CommandHandler("points", points))
     app.add_handler(CommandHandler("getvideo", do_get_video))
+    app.add_handler(CommandHandler("dailybonus", daily_bonus))
     app.add_handler(CommandHandler("refer", refer))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("admin", admin_dashboard))
