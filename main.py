@@ -44,6 +44,10 @@ DELETE_AFTER_SECONDS = 300
 
 DATA_FILE = Path("/data/data.json")
 
+DATA_FILE.parent.mkdir(
+    parents=True,
+    exist_ok=True
+)
 if not DATA_FILE.exists():
     DATA_FILE.write_text(
         '{"users":{},"videos":[],"welcome_image_file_id":null,"welcome_messages":[],"buy_points_link":null,"forced_channels":[]}',
@@ -490,6 +494,7 @@ def build_forced_channels_keyboard(data: Dict[str, Any]) -> InlineKeyboardMarkup
             buttons.append([InlineKeyboardButton(label, callback_data="no_join_link")])
 
     buttons.append([InlineKeyboardButton("➕ Add Channel", callback_data="forced_channels_add")])
+    buttons.append([InlineKeyboardButton("➖ Remove Channel", callback_data="forced_channels_remove")])
     buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="forced_channels_back")])
     return InlineKeyboardMarkup(buttons)
 
@@ -519,6 +524,7 @@ def get_user(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
             "referred_count": 0,
             "milestone_rewards_claimed": 0,
             "daily_bonus_date": None,
+            "last_bonus_reminder": None,
             "video_index": 0,
             "videos_sent": 0,
             "first_seen": None,
@@ -526,6 +532,7 @@ def get_user(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
             "last_seen": None,
             "last_active_date": None,
             "total_uses": 0,
+            "inactive_reminder_sent": False,
         }
     user = users[key]
     user.setdefault("points", 0)
@@ -536,6 +543,7 @@ def get_user(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
     user.setdefault("referred_count", 0)
     user.setdefault("milestone_rewards_claimed", 0)
     user.setdefault("daily_bonus_date", None)
+    user.setdefault("last_bonus_reminder", None)
     user.setdefault("video_index", 0)
     user.setdefault("videos_sent", 0)
     user.setdefault("first_seen", None)
@@ -543,6 +551,7 @@ def get_user(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
     user.setdefault("last_seen", None)
     user.setdefault("last_active_date", None)
     user.setdefault("total_uses", 0)
+    user.setdefault("inactive_reminder_sent", False)
     return user
 
 
@@ -554,6 +563,7 @@ def touch_user(data: Dict[str, Any], user_id: int) -> Dict[str, Any]:
     user["last_seen"] = timestamp()
     user["last_active_date"] = day
     user["total_uses"] = int(user.get("total_uses", 0)) + 1
+    user["inactive_reminder_sent"] = False
     return user
 
 
@@ -1261,7 +1271,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     context.user_data["broadcast_mode"] = True
     await update.message.reply_text(
-        "📢 Send the message you want to broadcast to all users.",
+        "📢 Send text, photo, video, GIF, or document to broadcast.",
         reply_markup=admin_menu(),
     )
 
@@ -1440,6 +1450,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if query.data == "forced_channels_back" and is_admin(user_id):
         context.user_data["forced_channels_add_mode"] = False
+        context.user_data["forced_channels_remove_mode"] = False
         await query.message.reply_text("⬅️ Back to admin menu.", reply_markup=admin_menu())
         return
 
@@ -1449,6 +1460,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "Send the channel in one of these formats:\n"
             "@publicchannel\n"
             "-1001234567890|https://t.me/+invite-link",
+            reply_markup=admin_menu(),
+        )
+        return
+
+    if query.data == "forced_channels_remove" and is_admin(user_id):
+        data = load_data()
+        channels = get_all_required_channels(data)
+        if not channels:
+            await query.message.reply_text(
+                "No channels available to remove.",
+                reply_markup=admin_menu(),
+            )
+            return
+
+        context.user_data["forced_channels_remove_mode"] = True
+
+        lines = ["Send channel number to remove:", ""]
+        for idx, channel in enumerate(channels, start=1):
+            lines.append(f"{idx}. {channel_label(channel, idx)}")
+
+        await query.message.reply_text(
+            "\n".join(lines),
             reply_markup=admin_menu(),
         )
         return
@@ -1489,6 +1522,26 @@ async def handle_admin_photo_upload(update: Update, context: ContextTypes.DEFAUL
     if not update.message or not update.effective_user:
         return
     if not is_admin(update.effective_user.id):
+        return
+
+    if context.user_data.get("broadcast_mode"):
+        if update.message.photo:
+            file_id = update.message.photo[-1].file_id
+            content_type = "photo"
+        elif update.message.animation:
+            file_id = update.message.animation.file_id
+            content_type = "animation"
+        else:
+            return
+
+        try:
+            sent, failed = await execute_broadcast(context, content_type=content_type, file_id=file_id, caption=update.message.caption)
+            await update.message.reply_text(
+                f"✅ Broadcast done. Sent: {sent}, Failed: {failed}",
+                reply_markup=admin_menu(),
+            )
+        finally:
+            context.user_data.pop("broadcast_mode", None)
         return
 
     if context.user_data.get("welcome_message_mode") == "add":
@@ -1537,6 +1590,24 @@ async def handle_admin_video_upload(update: Update, context: ContextTypes.DEFAUL
     if not update.message or not update.effective_user:
         return
     if not is_admin(update.effective_user.id):
+        return
+
+    if context.user_data.get("broadcast_mode"):
+        file_id = None
+        if update.message.video:
+            file_id = update.message.video.file_id
+        elif update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("video/"):
+            file_id = update.message.document.file_id
+        
+        if file_id:
+            try:
+                sent, failed = await execute_broadcast(context, content_type="video", file_id=file_id, caption=update.message.caption)
+                await update.message.reply_text(
+                    f"✅ Broadcast done. Sent: {sent}, Failed: {failed}",
+                    reply_markup=admin_menu(),
+                )
+            finally:
+                context.user_data.pop("broadcast_mode", None)
         return
 
     if context.user_data.get("welcome_message_mode") == "add":
@@ -1590,6 +1661,64 @@ async def handle_admin_video_upload(update: Update, context: ContextTypes.DEFAUL
         f"✅ Saved video #{len(videos)} successfully.\nTotal videos stored: {len(videos)}",
         reply_markup=admin_menu(),
     )
+
+
+async def handle_admin_document_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        return
+    if context.user_data.get("broadcast_mode") and update.message.document:
+        file_id = update.message.document.file_id
+        try:
+            sent, failed = await execute_broadcast(context, content_type="document", file_id=file_id, caption=update.message.caption)
+            await update.message.reply_text(
+                f"✅ Broadcast done. Sent: {sent}, Failed: {failed}",
+                reply_markup=admin_menu(),
+            )
+        finally:
+            context.user_data.pop("broadcast_mode", None)
+        return
+
+
+async def execute_broadcast(
+    context: ContextTypes.DEFAULT_TYPE,
+    content_type: str,
+    text: str | None = None,
+    file_id: str | None = None,
+    caption: str | None = None,
+) -> tuple[int, int]:
+    data = load_data()
+    users = get_users(data)
+    sent = 0
+    failed = 0
+
+    for user_id_str in list(users.keys()):
+        try:
+            chat_id = int(user_id_str)
+        except Exception:
+            failed += 1
+            continue
+            
+        try:
+            if content_type == "text" and text:
+                await context.bot.send_message(chat_id=chat_id, text=text)
+            elif content_type == "photo" and file_id:
+                await context.bot.send_photo(chat_id=chat_id, photo=file_id, caption=caption)
+            elif content_type == "video" and file_id:
+                await context.bot.send_video(chat_id=chat_id, video=file_id, caption=caption)
+            elif content_type == "animation" and file_id:
+                await context.bot.send_animation(chat_id=chat_id, animation=file_id, caption=caption)
+            elif content_type == "document" and file_id:
+                await context.bot.send_document(chat_id=chat_id, document=file_id, caption=caption)
+            else:
+                continue
+            sent += 1
+        except Exception as exc:
+            logger.warning("Broadcast failed for %s: %s", chat_id, exc)
+            failed += 1
+    
+    return sent, failed
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1655,6 +1784,51 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(
             f"✅ Buy points link saved:\n{link}",
             reply_markup=admin_menu(),
+        )
+        return
+
+    if is_admin(user_id) and context.user_data.get("forced_channels_remove_mode"):
+        if text.lower() in {"back", "cancel"}:
+            context.user_data["forced_channels_remove_mode"] = False
+            await update.message.reply_text(
+                "❌ Channel removal cancelled.",
+                reply_markup=admin_menu(),
+            )
+            return
+
+        try:
+            index = int(text)
+        except ValueError:
+            await update.message.reply_text("Send a valid channel number.")
+            return
+
+        data = load_data()
+        forced_channels = get_forced_channels(data)
+        legacy_count = 1 if legacy_required_channel_entry() else 0
+        visible_channels = get_all_required_channels(data)
+
+        if index < 1 or index > len(visible_channels):
+            await update.message.reply_text("Channel number out of range.")
+            return
+
+        real_index = index - 1 - legacy_count
+
+        if real_index < 0:
+            await update.message.reply_text("Legacy main channel cannot be removed.")
+            return
+
+        if real_index >= len(forced_channels):
+            await update.message.reply_text("Channel number out of range.")
+            return
+
+        forced_channels.pop(real_index)
+        data["forced_channels"] = forced_channels
+        save_data(data)
+        context.user_data["forced_channels_remove_mode"] = False
+
+        await update.message.reply_text(
+            build_forced_channels_text(data),
+            reply_markup=build_forced_channels_keyboard(data),
         )
         return
 
@@ -1750,23 +1924,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
     if is_admin(user_id) and context.user_data.get("broadcast_mode"):
-        context.user_data["broadcast_mode"] = False
-        data = load_data()
-        users = get_users(data)
-
-        sent = 0
-        failed = 0
-        for user_id_str in list(users.keys()):
-            try:
-                await context.bot.send_message(chat_id=int(user_id_str), text=text)
-                sent += 1
-            except Exception:
-                failed += 1
-
-        await update.message.reply_text(
-            f"✅ Broadcast done. Sent: {sent}, Failed: {failed}",
-            reply_markup=admin_menu(),
-        )
+        try:
+            sent, failed = await execute_broadcast(context, content_type="text", text=text)
+            await update.message.reply_text(
+                f"✅ Broadcast done. Sent: {sent}, Failed: {failed}",
+                reply_markup=admin_menu(),
+            )
+        finally:
+            context.user_data.pop("broadcast_mode", None)
         return
 
     if text in {"🎬 GET VIDEO 🎬", "Get Video"}:
@@ -1806,7 +1971,45 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # APP
 # =====================
 
+async def daily_bonus_reminder_job(context):
+    data = load_data()
+    today = today_key()
+    changed = False
+    for uid, user in list(get_users(data).items()):
+        try:
+            if user.get("daily_bonus_date") != today and user.get("last_bonus_reminder") != today:
+                await context.bot.send_message(
+                    int(uid),
+                    "🎁 Your Daily Bonus Is Ready!\n\nClaim your free point now.\n\n👥 Refer friends and earn more points.\n🎬 More points = More videos."
+                )
+                user["last_bonus_reminder"] = today
+                changed = True
+        except Exception as exc:
+            logger.warning("Daily reminder failed for %s: %s", uid, exc)
+    if changed:
+        save_data(data)
 
+async def inactive_user_reminder_job(context):
+    data = load_data()
+    changed = False
+    for uid, user in list(get_users(data).items()):
+        try:
+            last = str(user.get("last_active_date") or "")
+            if last:
+                from datetime import date
+                d = date.fromisoformat(last)
+                today = now_local().date()
+                if (today - d).days >= 3 and not user.get("inactive_reminder_sent"):
+                    await context.bot.send_message(
+                        int(uid),
+                        "😎 We Miss You!\n\n🎁 Your daily bonus may be waiting.\n👥 Refer friends to earn more points."
+                    )
+                    user["inactive_reminder_sent"] = True
+                    changed = True
+        except Exception as exc:
+            logger.warning("Inactive reminder failed for %s: %s", uid, exc)
+    if changed:
+        save_data(data)
 
 async def post_init(application) -> None:
     await application.bot.set_my_commands(
@@ -1831,7 +2034,32 @@ def build_app() -> Any:
             "REQUIRED_CHAT_LINK is empty and REQUIRED_CHAT_ID is numeric. For private groups/channels, set REQUIRED_CHAT_LINK."
         )
 
+    data = load_data()
+    logger.info("Loaded %s videos", len(get_videos(data)))
+    logger.info("Loaded %s users", len(get_users(data)))
+
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+
+    from datetime import time
+    if app.job_queue:
+        app.job_queue.run_daily(
+            daily_bonus_reminder_job,
+            time=time(
+                hour=10,
+                minute=0,
+                tzinfo=ZoneInfo(TIMEZONE_NAME),
+            ),
+            name="daily_bonus_reminder",
+        )
+        app.job_queue.run_daily(
+            inactive_user_reminder_job,
+            time=time(
+                hour=18,
+                minute=0,
+                tzinfo=ZoneInfo(TIMEZONE_NAME),
+            ),
+            name="inactive_user_reminder",
+        )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("dashboard", dashboard))
@@ -1849,6 +2077,7 @@ def build_app() -> Any:
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE | filters.ANIMATION, handle_admin_photo_upload))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_admin_video_upload))
+    app.add_handler(MessageHandler(filters.Document.ALL & ~filters.Document.IMAGE & ~filters.Document.VIDEO, handle_admin_document_broadcast))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     return app
